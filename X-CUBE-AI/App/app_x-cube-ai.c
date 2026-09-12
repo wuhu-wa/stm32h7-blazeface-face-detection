@@ -99,6 +99,19 @@ static uint8_t face_result_count = 0U;
 static uint8_t face_preprocess_map_ready = 0U;
 static uint32_t ai_last_process_ms = 0U;
 
+#if defined(__CC_ARM)
+__align(32) static uint8_t pool0_raw[AI_DETECT_DATA_ACTIVATION_1_SIZE + 31U];
+#else
+static uint8_t pool0_raw[AI_DETECT_DATA_ACTIVATION_1_SIZE + 31U] __attribute__((aligned(32)));
+#endif
+
+#define AI_ALIGN_32_PTR(ptr_) \
+  ((ai_handle)((((uint32_t)(ptr_)) + 31U) & ~31U))
+
+static int ai_ready = 0;
+static volatile ai_error ai_last_error = {AI_ERROR_NONE, AI_ERROR_CODE_NONE};
+static const char *ai_last_error_fct = NULL;
+
 static float face_sigmoid(float value);
 static float face_iou(const face_detection_t *a, const face_detection_t *b);
 static void face_prepare_preprocess_map(void);
@@ -146,15 +159,6 @@ NULL
 
 /* Activations buffers -------------------------------------------------------*/
 
-#if defined(__CC_ARM)
-__align(32) static uint8_t pool0_raw[AI_DETECT_DATA_ACTIVATION_1_SIZE + 31U];
-#else
-static uint8_t pool0_raw[AI_DETECT_DATA_ACTIVATION_1_SIZE + 31U] __attribute__((aligned(32)));
-#endif
-
-#define AI_ALIGN_32_PTR(ptr_) \
-  ((ai_handle)((((uint32_t)(ptr_)) + 31U) & ~31U))
-
 ai_handle data_activations0[] = {AI_HANDLE_NULL};
 
 /* AI objects ----------------------------------------------------------------*/
@@ -163,9 +167,6 @@ static ai_handle detect = AI_HANDLE_NULL;
 
 static ai_buffer* ai_input;
 static ai_buffer* ai_output;
-static int ai_ready = 0;
-static volatile ai_error ai_last_error = {AI_ERROR_NONE, AI_ERROR_CODE_NONE};
-static const char *ai_last_error_fct = NULL;
 
 static void ai_log_err(const ai_error err, const char *fct)
 {
@@ -280,6 +281,82 @@ static int ai_run(void)
 }
 
 /* USER CODE BEGIN 2 */
+static int ai_bootstrap_safe(ai_handle *act_addr)
+{
+  ai_error err;
+
+  ai_ready = 0;
+
+  if ((act_addr == NULL) || (act_addr[0] == AI_HANDLE_NULL)) {
+    err.type = AI_ERROR_INIT_FAILED;
+    err.code = AI_ERROR_CODE_NETWORK_ACTIVATIONS;
+    ai_log_err(err, "activations_null");
+    return -1;
+  }
+
+  if ((((uint32_t)act_addr[0]) & 0x1FU) != 0U) {
+    err.type = AI_ERROR_INIT_FAILED;
+    err.code = AI_ERROR_CODE_NETWORK_ACTIVATIONS;
+    ai_log_err(err, "activations_align");
+    return -1;
+  }
+
+  err = ai_detect_create_and_init(&detect, act_addr, NULL);
+  if (err.type != AI_ERROR_NONE) {
+    ai_log_err(err, "ai_detect_create_and_init");
+    return -1;
+  }
+
+  ai_input = ai_detect_inputs_get(detect, NULL);
+  ai_output = ai_detect_outputs_get(detect, NULL);
+
+  if ((ai_input == NULL) || (ai_output == NULL)) {
+    err.type = AI_ERROR_INIT_FAILED;
+    err.code = AI_ERROR_CODE_INVALID_PTR;
+    ai_log_err(err, "io_desc_null");
+    return -1;
+  }
+
+#if defined(AI_DETECT_INPUTS_IN_ACTIVATIONS)
+  for (int idx=0; idx < AI_DETECT_IN_NUM; idx++) {
+    data_ins[idx] = ai_input[idx].data;
+  }
+#else
+  for (int idx=0; idx < AI_DETECT_IN_NUM; idx++) {
+    ai_input[idx].data = data_ins[idx];
+  }
+#endif
+
+#if defined(AI_DETECT_OUTPUTS_IN_ACTIVATIONS)
+  for (int idx=0; idx < AI_DETECT_OUT_NUM; idx++) {
+    data_outs[idx] = ai_output[idx].data;
+  }
+#else
+  for (int idx=0; idx < AI_DETECT_OUT_NUM; idx++) {
+    ai_output[idx].data = data_outs[idx];
+  }
+#endif
+
+  if ((data_ins[0] == NULL) || ((((uint32_t)data_ins[0]) & 0x03U) != 0U)) {
+    err.type = AI_ERROR_INIT_FAILED;
+    err.code = AI_ERROR_CODE_INVALID_PTR;
+    ai_log_err(err, "input_ptr");
+    return -1;
+  }
+
+  for (int idx=0; idx < AI_DETECT_OUT_NUM; idx++) {
+    if ((data_outs[idx] == NULL) || ((((uint32_t)data_outs[idx]) & 0x03U) != 0U)) {
+      err.type = AI_ERROR_INIT_FAILED;
+      err.code = AI_ERROR_CODE_INVALID_PTR;
+      ai_log_err(err, "output_ptr");
+      return -1;
+    }
+  }
+
+  ai_ready = 1;
+  return 0;
+}
+
 static float face_sigmoid(float value)
 {
   if (value < -80.0f)
@@ -656,32 +733,6 @@ void MX_X_CUBE_AI_DrawDetections(void)
     }
   }
 }
-/* USER CODE END 2 */
-
-/* Entry points --------------------------------------------------------------*/
-
-void MX_X_CUBE_AI_Init(void)
-{
-    /* USER CODE BEGIN 5 */
-  ai_error err = {AI_ERROR_NONE, AI_ERROR_CODE_NONE};
-
-  ai_last_error = err;
-  ai_last_error_fct = NULL;
-
-  data_activations0[0] = AI_ALIGN_32_PTR(pool0_raw);
-  face_prepare_preprocess_map();
-
-  printf("\r\nTEMPLATE - initialization\r\n");
-
-  if (ai_boostrap(data_activations0) != 0) {
-    if (ai_last_error.type == AI_ERROR_NONE) {
-      err.type = AI_ERROR_INIT_FAILED;
-      err.code = AI_ERROR_CODE_NETWORK;
-      ai_log_err(err, "ai_boostrap");
-    }
-  }
-    /* USER CODE END 5 */
-}
 
 int MX_X_CUBE_AI_IsReady(void)
 {
@@ -701,6 +752,32 @@ const char *MX_X_CUBE_AI_GetLastErrorFunction(void)
 uint32_t MX_X_CUBE_AI_GetLastProcessMs(void)
 {
   return (ai_last_process_ms > 999U) ? 999U : ai_last_process_ms;
+}
+/* USER CODE END 2 */
+
+/* Entry points --------------------------------------------------------------*/
+
+void MX_X_CUBE_AI_Init(void)
+{
+    /* USER CODE BEGIN 5 */
+  ai_error err = {AI_ERROR_NONE, AI_ERROR_CODE_NONE};
+
+  ai_last_error = err;
+  ai_last_error_fct = NULL;
+
+  data_activations0[0] = AI_ALIGN_32_PTR(pool0_raw);
+  face_prepare_preprocess_map();
+
+  printf("\r\nTEMPLATE - initialization\r\n");
+
+  if (ai_bootstrap_safe(data_activations0) != 0) {
+    if (ai_last_error.type == AI_ERROR_NONE) {
+      err.type = AI_ERROR_INIT_FAILED;
+      err.code = AI_ERROR_CODE_NETWORK;
+      ai_log_err(err, "ai_bootstrap_safe");
+    }
+  }
+    /* USER CODE END 5 */
 }
 
 void MX_X_CUBE_AI_Process(void)
